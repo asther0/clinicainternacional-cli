@@ -1,0 +1,28 @@
+{
+  "name": "clinicainternacional-cli",
+  "version": "0.1.0",
+  "description": "Conservative agent-facing tracer for Clínica Internacional appointments",
+  "type": "module",
+  "bin": { "clinicai": "dist/cli.js" },
+  "files": ["dist", "README.md", "package.json"],
+  "engines": { "node": ">=20" },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "bun test",
+    "build": "bun build ./src/cli.ts --outdir ./dist --target node --format esm --sourcemap=linked --external playwright --external @napi-rs/keyring",
+    "prepack": "bun run build"
+  },
+  "keywords": ["clinica-internacional", "appointments", "cli"],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/asther0/clinicainternacional-cli.git"
+  },
+  "bugs": { "url": "https://github.com/asther0/clinicainternacional-cli/issues" },
+  "homepage": "https://github.com/asther0/clinicainternacional-cli#readme",
+  "license": "UNLICENSED",
+  "dependencies": {
+    "@napi-rs/keyring": "^1.2.0",
+    "playwright": "^1.54.0"
+  },
+  "devDependencies": { "@types/node": "^20.19.0", "bun-types": "^1.3.14", "typescript": "^5.8.3" }
+}
