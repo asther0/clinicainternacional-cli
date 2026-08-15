@@ -14,6 +14,7 @@ export const appointmentPath = "/v2/appointments/appointmentslist";
 const loginUrl = `${frontendOrigin}${loginPath}`;
 const replayHeaderNames = new Set(["authorization", "cookie", "channel", "idtransaction"]);
 const maxRememberedDocumentLength = 64;
+const appointmentsCaptureTimeout = 120_000;
 export const loginDocumentSelector = 'input[placeholder="Nro de documento"]';
 
 /** Accepts only the explicitly opted-in document submitted through the login form. */
@@ -69,6 +70,65 @@ async function captureDocumentWhenSubmitted(page: Page, rememberDocument: boolea
   return () => identity;
 }
 
+type ActivatedCapture<T> = {
+  waitForAuthenticatedControl: () => Promise<void>;
+  armResponse: (timeout: number) => Promise<T>;
+  activateControl: () => Promise<void>;
+  validate: (response: T) => Promise<void>;
+  timeout?: number;
+};
+
+/**
+ * Ignore pre-authentication traffic, arm the response listener before activation,
+ * and keep waiting after a contract mismatch for another eligible response.
+ */
+export async function captureAfterAuthenticatedActivation<T>({
+  waitForAuthenticatedControl,
+  armResponse,
+  activateControl,
+  validate,
+  timeout = appointmentsCaptureTimeout,
+}: ActivatedCapture<T>): Promise<T> {
+  await waitForAuthenticatedControl();
+  const deadline = Date.now() + timeout;
+  const remaining = () => Math.max(1, deadline - Date.now());
+  let candidate = armResponse(remaining());
+  await activateControl();
+  let observedMismatch = false;
+
+  for (;;) {
+    try {
+      const response = await candidate;
+      try {
+        await validate(response);
+        return response;
+      } catch (error) {
+        if (!(error instanceof CliError) || error.code !== "PORTAL_CONTRACT_CHANGED") throw error;
+        observedMismatch = true;
+      }
+      if (Date.now() >= deadline) throw new CliError("PORTAL_CONTRACT_CHANGED");
+      candidate = armResponse(remaining());
+    } catch (error) {
+      if (observedMismatch) throw new CliError("PORTAL_CONTRACT_CHANGED");
+      throw error;
+    }
+  }
+}
+
+async function validateObservedAppointmentsResponse(response: import("playwright").Response): Promise<void> {
+  let observed: unknown;
+  try {
+    observed = await response.json();
+  } catch {
+    throw new CliError("PORTAL_CONTRACT_CHANGED");
+  }
+  try {
+    parseAppointmentsEnvelope(observed);
+  } catch {
+    throw new CliError("PORTAL_CONTRACT_CHANGED");
+  }
+}
+
 /** Exact, minimal direct replay. It never invokes browser automation as a fallback. */
 export class DirectHttpTransport implements PortalTransport {
   constructor(private readonly request: FetchLike = fetch) {}
@@ -78,8 +138,16 @@ export class DirectHttpTransport implements PortalTransport {
     if (result.status === 401 || result.status === 403) throw new CliError("AUTH_REQUIRED");
     if (!result.ok) throw new CliError("PORTAL_REQUEST_FAILED");
     let payload: unknown;
-    try { payload = await result.json(); } catch { throw new CliError("PORTAL_CONTRACT_CHANGED"); }
-    parseAppointmentsEnvelope(payload);
+    try {
+      payload = await result.json();
+    } catch {
+      throw new CliError("PORTAL_CONTRACT_CHANGED");
+    }
+    try {
+      parseAppointmentsEnvelope(payload);
+    } catch {
+      throw new CliError("PORTAL_CONTRACT_CHANGED");
+    }
     return payload;
   }
 }
@@ -93,14 +161,17 @@ export async function observeLogin(options: { rememberDocument: boolean; identit
     await page.goto(loginUrl, { waitUntil: "domcontentloaded" });
     await prefillDocument(page, options.identity);
     const submittedIdentity = await captureDocumentWhenSubmitted(page, options.rememberDocument);
-    const response = await page.waitForResponse((candidate) => {
-      const request = candidate.request();
-      if (request.method() !== "GET" || !candidate.ok()) return false;
-      try { validatedUrl(request.url()); return true; } catch { return false; }
-    }, { timeout: 0 });
-    let observed: unknown;
-    try { observed = await response.json(); } catch { throw new CliError("PORTAL_CONTRACT_CHANGED"); }
-    parseAppointmentsEnvelope(observed);
+    const misCitas = page.getByText("Mis citas", { exact: true }).first();
+    const response = await captureAfterAuthenticatedActivation({
+      waitForAuthenticatedControl: () => misCitas.waitFor({ state: "visible", timeout: 0 }),
+      armResponse: (timeout) => page.waitForResponse((candidate) => {
+        const request = candidate.request();
+        if (request.method() !== "GET" || !candidate.ok()) return false;
+        try { validatedUrl(request.url()); return true; } catch { return false; }
+      }, { timeout }),
+      activateControl: () => misCitas.click(),
+      validate: validateObservedAppointmentsResponse,
+    });
     const session: Session = { version: 1, request: await captureRequest(response.request(), context) };
     // Browser and context deliberately remain open until this direct replay proves the artifact.
     await new DirectHttpTransport(options.replay).listAppointments(session);

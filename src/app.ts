@@ -19,7 +19,7 @@ async function logout(vault: SessionVault): Promise<void> {
 export async function run(args: string[], dependencies: Dependencies = {}): Promise<RunResult> {
   const vault = dependencies.vault ?? new KeychainVault();
   const transport = dependencies.transport ?? new DirectHttpTransport();
-  const login = dependencies.login ?? observeLogin;
+  const login = dependencies.login ?? ((options) => observeLogin({ ...options }));
   try {
     const rememberDocument = args[0] === "auth" && args[1] === "login" && args[2] === "--remember-document" && args.length === 3;
     if ((args[0] === "auth" && args[1] === "login" && args.length === 2) || rememberDocument) {
