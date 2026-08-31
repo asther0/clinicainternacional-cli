@@ -11,7 +11,7 @@ clinicai auth logout
 clinicai appointments list
 ```
 
-Each command writes one JSON object to stdout. A remembered document is opt-in, captured only when the official login form is submitted, and prefilled only in its `Nro de documento` input. It is never printed, passed as an argument, or stored with a password. `auth forget-document` deletes only that value; `auth logout` deletes both session and remembered document and is safe to repeat.
+Each command writes one JSON object to stdout. A remembered document is opt-in, captured only when the official `Ingresar` control is activated, and prefilled only in its `Nro de documento` input. It is never printed, passed as an argument, or stored with a password. `auth forget-document` deletes only that value; `auth logout` deletes both session and remembered document and is safe to repeat.
 
 ## Current behavior
 
@@ -21,7 +21,7 @@ The parser only normalizes the three exact empty response forms observed in the 
 
 ## Evidence
 
-A live macOS run on 2026-08-15 validated `auth login`, Keychain session reuse on a second invocation, and `appointments list` returning an empty list. The offline suite is 20 tests and remains fake-only: it exercises parsers and replay behavior without touching a live portal or Keychain.
+A live macOS run on 2026-08-30 validated opt-in document capture through the official `Ingresar` activation, Keychain persistence only after successful replay, reuse by `appointments list`, and redacted output containing only `documentLast3`. The offline suite is 27 tests and remains fake-only: it exercises parsers and replay behavior without touching a live portal or Keychain.
 
 ```sh
 bun install
