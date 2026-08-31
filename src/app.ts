@@ -1,5 +1,5 @@
 import { CliError } from "./errors.js";
-import { parseAppointments, parsePatients } from "./parser.js";
+import { parseAppointments, parsePatients, parseSpecialties, type VisitType } from "./parser.js";
 import { DirectHttpTransport, observeLogin, type LoginCapture, type PortalTransport } from "./transport.js";
 import { KeychainVault, type SessionVault } from "./vault.js";
 
@@ -58,6 +58,19 @@ export async function run(args: string[], dependencies: Dependencies = {}): Prom
       try {
         const { profile, families } = await transport.listPatients(session, identity);
         return { stdout: line(parsePatients(profile, families, identity)), stderr: "", exitCode: 0 };
+      } catch (error) {
+        if (error instanceof CliError && error.code === "AUTH_REQUIRED") await vault.deleteSession();
+        throw error;
+      }
+    }
+    if (args[0] === "specialties" && args[1] === "list") {
+      if (args.length !== 4 || args[2] !== "--visit-type" || (args[3] !== "CM" && args[3] !== "CV")) throw new CliError("USAGE");
+      const visitType = args[3] as VisitType;
+      const session = await vault.readSession();
+      if (!session) throw new CliError("AUTH_REQUIRED");
+      try {
+        const data = await transport.listSpecialties(session, visitType);
+        return { stdout: line(parseSpecialties(data, visitType)), stderr: "", exitCode: 0 };
       } catch (error) {
         if (error instanceof CliError && error.code === "AUTH_REQUIRED") await vault.deleteSession();
         throw error;

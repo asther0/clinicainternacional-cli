@@ -1,8 +1,8 @@
 import { describe, expect, test } from "bun:test";
 import { run } from "../src/app.js";
 import { CliError } from "../src/errors.js";
-import { compareAppointments, parseAppointmentsEnvelope, parseFamilies, parsePatients, parseProfile } from "../src/parser.js";
-import { DirectHttpTransport, backendOrigin, appointmentPath, captureAfterAuthenticatedActivation, captureDocumentOnOfficialLoginActivation, captureReplayRequest, familiesPath, installRememberedLoginPrefill, loginDocumentSelector, officialLoginButtonName, profilePath, readRememberedIdentityFromSessionStorage, rememberedIdentityFromAuthenticatedPair, rememberedIdentityFromSubmittedDocument, type LoginCapture, type PortalTransport } from "../src/transport.js";
+import { compareAppointments, parseAppointmentsEnvelope, parseFamilies, parsePatients, parseProfile, parseSpecialties } from "../src/parser.js";
+import { DirectHttpTransport, backendOrigin, appointmentPath, captureAfterAuthenticatedActivation, captureDocumentOnOfficialLoginActivation, captureReplayRequest, familiesPath, installRememberedLoginPrefill, loginDocumentSelector, officialLoginButtonName, profilePath, readRememberedIdentityFromSessionStorage, rememberedIdentityFromAuthenticatedPair, rememberedIdentityFromSubmittedDocument, specialtyPath, type LoginCapture, type PortalTransport } from "../src/transport.js";
 import { MemoryVault, type RememberedIdentity, type Session, type SessionVault } from "../src/vault.js";
 
 const request = { url: `${backendOrigin}${appointmentPath}`, headers: { authorization: "Bearer redacted", channel: "web", idtransaction: "opaque", cookie: "sid=redacted" } };
@@ -25,6 +25,7 @@ class FakeTransport implements PortalTransport {
   constructor(private readonly data: unknown = empty, private readonly failure?: CliError) {}
   async listAppointments() { if (this.failure) throw this.failure; return this.data; }
   async listPatients(): Promise<{ profile: unknown; families: unknown }> { throw new Error("not used"); }
+  async listSpecialties(): Promise<unknown> { throw new Error("not used"); }
 }
 
 const loginResult: LoginCapture = { session, rememberedIdentity: null };
@@ -859,11 +860,12 @@ describe("clinicai tracer contract", () => {
     expect(result.exitCode).toBe(1);
   });
 
-  test("USAGE message advertises patients list", () => {
+  test("USAGE message advertises patient and specialty discovery", () => {
     const result = (async () => run(["nope"]))();
     return result.then((value) => {
       expect(value.stderr).toBe("USAGE\n");
       expect(value.stdout).toContain("clinicai patients list");
+      expect(value.stdout).toContain("clinicai specialties list --visit-type <CM|CV>");
     });
   });
 
@@ -940,5 +942,138 @@ describe("installRememberedLoginPrefill", () => {
     await expect(
       installRememberedLoginPrefill(fakePage as never, { document: "12345678", documentType: "1" }),
     ).resolves.toBeUndefined();
+  });
+});
+
+describe("specialties list", () => {
+  const fixture = {
+    auditResponse: { ...auditedEmpty.auditResponse },
+    bodyResponse: {
+      specialties: [
+        {
+          headquarters: [
+            { codeHeadquarters: "1004", nameHeadquarters: "Surco", visitType: "CM" },
+            { codeHeadquarters: "1001", nameHeadquarters: "Lima", visitType: "CM" },
+          ],
+          isPediatric: "false",
+          isPrincipal: "true",
+          specialtyCode: "S2",
+          specialtyModal: { title: "internal-only" },
+          specialtyName: "Traumatologia",
+        },
+        {
+          headquarters: [{ codeHeadquarters: "1002", nameHeadquarters: "San Borja", visitType: "CM" }],
+          isPediatric: "true",
+          isPrincipal: "false",
+          specialtyCode: "S1",
+          specialtyModal: null,
+          specialtyName: "Cardiologia",
+        },
+      ],
+    },
+  };
+
+  test("parses, redacts, and sorts the exact observed specialty contract", () => {
+    const parsed = parseSpecialties(fixture, "CM");
+    expect(parsed).toEqual({
+      ok: true,
+      visitType: "CM",
+      specialties: [
+        { code: "S1", name: "Cardiologia", isPediatric: true, isPrincipal: false, locations: [{ code: "1002", name: "San Borja" }] },
+        { code: "S2", name: "Traumatologia", isPediatric: false, isPrincipal: true, locations: [{ code: "1001", name: "Lima" }, { code: "1004", name: "Surco" }] },
+      ],
+    });
+    const serialized = JSON.stringify(parsed);
+    expect(serialized).not.toContain("auditResponse");
+    expect(serialized).not.toContain("specialtyModal");
+    expect(serialized).not.toContain("internal-only");
+  });
+
+  test("rejects item, flag, headquarters, and visit-type drift", () => {
+    const clone = () => structuredClone(fixture);
+    const cases: unknown[] = [];
+    const extraItem = clone(); Object.assign(extraItem.bodyResponse.specialties[0], { extra: true }); cases.push(extraItem);
+    const badFlag = clone(); badFlag.bodyResponse.specialties[0].isPrincipal = "1"; cases.push(badFlag);
+    const badModal = clone(); (badModal.bodyResponse.specialties[0] as unknown as Record<string, unknown>).specialtyModal = []; cases.push(badModal);
+    const extraHeadquarters = clone(); Object.assign(extraHeadquarters.bodyResponse.specialties[0].headquarters[0], { extra: true }); cases.push(extraHeadquarters);
+    const wrongVisitType = clone(); wrongVisitType.bodyResponse.specialties[0].headquarters[0].visitType = "CV"; cases.push(wrongVisitType);
+    const extraBody = clone(); Object.assign(extraBody.bodyResponse, { extra: true }); cases.push(extraBody);
+    for (const value of cases) expect(() => parseSpecialties(value, "CM")).toThrow(CliError);
+    expect(() => parseSpecialties(fixture, "CV")).toThrow(CliError);
+  });
+
+  test("uses the exact specialty POST request", async () => {
+    const calls: Array<{ input: string; init: RequestInit }> = [];
+    const transport = new DirectHttpTransport(async (input, init) => {
+      calls.push({ input, init });
+      return new Response(JSON.stringify(fixture), { status: 200 });
+    });
+    expect(await transport.listSpecialties(session, "CM")).toEqual(fixture);
+    expect(calls).toEqual([{
+      input: `${backendOrigin}${specialtyPath}`,
+      init: {
+        method: "POST",
+        headers: { ...request.headers, "content-type": "application/json" },
+        body: JSON.stringify({ visible: true, visitType: "CM", isCuidate: false }),
+      },
+    }]);
+  });
+
+  test("runs the command and invalidates an expired session", async () => {
+    const transport: PortalTransport = {
+      async listAppointments() { throw new Error("not used"); },
+      async listPatients() { throw new Error("not used"); },
+      async listSpecialties() { return fixture; },
+    };
+    const success = await execute(["specialties", "list", "--visit-type", "CM"], new MemoryVault(session), transport);
+    expect(JSON.parse(success.stdout)).toEqual(parseSpecialties(fixture, "CM"));
+
+    const vault = new MemoryVault(session);
+    const expired: PortalTransport = {
+      async listAppointments() { throw new Error("not used"); },
+      async listPatients() { throw new Error("not used"); },
+      async listSpecialties() { throw new CliError("AUTH_REQUIRED"); },
+    };
+    const result = await execute(["specialties", "list", "--visit-type", "CV"], vault, expired);
+    expect(result.exitCode).toBe(1);
+    expect(JSON.parse(result.stdout).error.code).toBe("AUTH_REQUIRED");
+    expect(await vault.readSession()).toBeNull();
+  });
+
+  test("rejects missing or invalid visit type before transport", async () => {
+    let calls = 0;
+    const transport: PortalTransport = {
+      async listAppointments() { throw new Error("not used"); },
+      async listPatients() { throw new Error("not used"); },
+      async listSpecialties() { calls += 1; throw new Error("should not call"); },
+    };
+    for (const args of [
+      ["specialties", "list"],
+      ["specialties", "list", "--visit-type", ""],
+      ["specialties", "list", "--visit-type", "cm"],
+      ["specialties", "list", "--visit-type", "CM", "extra"],
+    ]) {
+      const result = await execute(args, new MemoryVault(session), transport);
+      expect(JSON.parse(result.stdout).error.code).toBe("USAGE");
+    }
+    expect(calls).toBe(0);
+  });
+
+  test("maps exact HTTP-200 expiry and rejects near misses", async () => {
+    const expired = {
+      auditResponse: {
+        date: "1970-01-01T00:00:00Z",
+        idTransaction: "opaque",
+        methodName: "opaque",
+        responseCode: "-1",
+        responseMessage: "Sesion expirada o no encontrada",
+        serviceName: "opaque",
+      },
+      bodyResponse: null,
+    };
+    await expect(new DirectHttpTransport(async () => new Response(JSON.stringify(expired))).listSpecialties(session, "CM"))
+      .rejects.toMatchObject({ code: "AUTH_REQUIRED" });
+    await expect(new DirectHttpTransport(async () => new Response(JSON.stringify({ ...expired, extra: true }))).listSpecialties(session, "CM"))
+      .rejects.toMatchObject({ code: "PORTAL_CONTRACT_CHANGED" });
   });
 });

@@ -96,6 +96,14 @@ export type ParsedProfile = {
 };
 
 export type PublicPatient = { ref: "holder"; name: string; documentLast3: string; relationship: "self" };
+export type VisitType = "CM" | "CV";
+export type PublicSpecialty = {
+  code: string;
+  name: string;
+  isPediatric: boolean;
+  isPrincipal: boolean;
+  locations: Array<{ code: string; name: string }>;
+};
 
 const PROFILE_PATIENT_KEYS = ["documentNumber", "documentType", "lastName", "lastName2", "names"] as const;
 const PROFILE_BODY_KEYS = ["liveWell", "patient"] as const;
@@ -193,4 +201,59 @@ export function parsePatients(
   const name = parts.join(" ");
   const documentLast3 = parsed.documentNumber.replace(/\D/g, "").slice(-3);
   return { ok: true, patients: [{ ref: "holder", name, documentLast3, relationship: "self" }] };
+}
+
+const SPECIALTY_KEYS = ["headquarters", "isPediatric", "isPrincipal", "specialtyCode", "specialtyModal", "specialtyName"] as const;
+const HEADQUARTERS_KEYS = ["codeHeadquarters", "nameHeadquarters", "visitType"] as const;
+
+function requiredTrimmedString(value: unknown): string {
+  if (typeof value !== "string") throw new CliError("PORTAL_CONTRACT_CHANGED");
+  const trimmed = value.trim();
+  if (!trimmed) throw new CliError("PORTAL_CONTRACT_CHANGED");
+  return trimmed;
+}
+
+function portalBoolean(value: unknown): boolean {
+  if (value === "true") return true;
+  if (value === "false") return false;
+  throw new CliError("PORTAL_CONTRACT_CHANGED");
+}
+
+function compareText(a: string, b: string): number {
+  return a < b ? -1 : a > b ? 1 : 0;
+}
+
+/** Parses the exact live specialty envelope and exposes only agent-safe filters. */
+export function parseSpecialties(
+  payload: unknown,
+  visitType: VisitType,
+): { ok: true; visitType: VisitType; specialties: PublicSpecialty[] } {
+  if (!object(payload) || !exactKeys(payload, ["auditResponse", "bodyResponse"])) throw new CliError("PORTAL_CONTRACT_CHANGED");
+  const audit = payload.auditResponse;
+  if (!object(audit) || !hasExactAuditShape(audit) || audit.responseCode !== "0") throw new CliError("PORTAL_CONTRACT_CHANGED");
+  const body = payload.bodyResponse;
+  if (!object(body) || !exactKeys(body, ["specialties"]) || !Array.isArray(body.specialties)) throw new CliError("PORTAL_CONTRACT_CHANGED");
+
+  const specialties = body.specialties.map((value): PublicSpecialty => {
+    if (!object(value) || !exactKeys(value, SPECIALTY_KEYS)) throw new CliError("PORTAL_CONTRACT_CHANGED");
+    if (value.specialtyModal !== null && !object(value.specialtyModal)) throw new CliError("PORTAL_CONTRACT_CHANGED");
+    if (!Array.isArray(value.headquarters)) throw new CliError("PORTAL_CONTRACT_CHANGED");
+    const locations = value.headquarters.map((headquarters) => {
+      if (!object(headquarters) || !exactKeys(headquarters, HEADQUARTERS_KEYS)) throw new CliError("PORTAL_CONTRACT_CHANGED");
+      if (headquarters.visitType !== visitType) throw new CliError("PORTAL_CONTRACT_CHANGED");
+      return {
+        code: requiredTrimmedString(headquarters.codeHeadquarters),
+        name: requiredTrimmedString(headquarters.nameHeadquarters),
+      };
+    }).sort((a, b) => compareText(a.name, b.name) || compareText(a.code, b.code));
+    return {
+      code: requiredTrimmedString(value.specialtyCode),
+      name: requiredTrimmedString(value.specialtyName),
+      isPediatric: portalBoolean(value.isPediatric),
+      isPrincipal: portalBoolean(value.isPrincipal),
+      locations,
+    };
+  }).sort((a, b) => compareText(a.name, b.name) || compareText(a.code, b.code));
+
+  return { ok: true, visitType, specialties };
 }

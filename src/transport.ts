@@ -1,11 +1,12 @@
 import { chromium, type BrowserContext, type Page, type Request } from "playwright";
 import { CliError } from "./errors.js";
-import { parseAppointmentsEnvelope, parseFamilies, parseProfile } from "./parser.js";
+import { parseAppointmentsEnvelope, parseFamilies, parseProfile, parseSpecialties, type VisitType } from "./parser.js";
 import type { CapturedRequest, RememberedIdentity, Session } from "./vault.js";
 
 export interface PortalTransport {
   listAppointments(session: Session): Promise<unknown>;
   listPatients(session: Session, identity: RememberedIdentity): Promise<{ profile: unknown; families: unknown }>;
+  listSpecialties(session: Session, visitType: VisitType): Promise<unknown>;
 }
 export type LoginCapture = { session: Session; rememberedIdentity: RememberedIdentity | null };
 export type FetchLike = (input: string, init: RequestInit) => Promise<Response>;
@@ -16,6 +17,7 @@ export const loginPath = "/authentication/login/login-first-step";
 export const appointmentPath = "/v2/appointments/appointmentslist";
 export const profilePath = "/v1/patientdata/obtaindata";
 export const familiesPath = "/v1/patientdata/familylist";
+export const specialtyPath = "/v2/specialty/specialtieslist";
 /** Exact accessible name of the visible official login control. */
 export const officialLoginButtonName = "Ingresar";
 const loginUrl = `${frontendOrigin}${loginPath}`;
@@ -335,6 +337,19 @@ export class DirectHttpTransport implements PortalTransport {
       throw new CliError("PORTAL_CONTRACT_CHANGED");
     }
     return { profile, families };
+  }
+
+  async listSpecialties(session: Session, visitType: VisitType): Promise<unknown> {
+    const url = validatedBackendPath(`${backendOrigin}${specialtyPath}`, specialtyPath);
+    const headers = { ...session.request.headers, "content-type": "application/json" };
+    const body = JSON.stringify({ visible: true, visitType, isCuidate: false });
+    const payload = await this.jsonRequest(url.toString(), { method: "POST", headers, body });
+    try {
+      parseSpecialties(payload, visitType);
+    } catch {
+      throw new CliError("PORTAL_CONTRACT_CHANGED");
+    }
+    return payload;
   }
 }
 

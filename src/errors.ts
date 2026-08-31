@@ -15,7 +15,7 @@ const messages: Record<ErrorCode, string> = {
   KEYCHAIN_UNAVAILABLE: "macOS Keychain is unavailable; no authentication data was changed.",
   PORTAL_CONTRACT_CHANGED: "The portal response no longer matches the supported contract.",
   LOGIN_NOT_COMPLETED: "Login was not completed before a supported appointment request was observed.",
-  USAGE: "Usage: clinicai auth <login [--remember-document]|status|logout|forget-document> | clinicai appointments list | clinicai patients list",
+  USAGE: "Usage: clinicai auth <login [--remember-document]|status|logout|forget-document> | clinicai appointments list | clinicai patients list | clinicai specialties list --visit-type <CM|CV>",
   PORTAL_REQUEST_FAILED: "The portal request could not be completed."
 };
 
