@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { run } from "../src/app.js";
 import { CliError } from "../src/errors.js";
 import { compareAppointments, parseAppointmentsEnvelope } from "../src/parser.js";
-import { DirectHttpTransport, backendOrigin, appointmentPath, captureAfterAuthenticatedActivation, captureReplayRequest, loginDocumentSelector, rememberedIdentityFromSubmittedDocument, type LoginCapture, type PortalTransport } from "../src/transport.js";
+import { DirectHttpTransport, backendOrigin, appointmentPath, captureAfterAuthenticatedActivation, captureDocumentOnOfficialLoginActivation, captureReplayRequest, loginDocumentSelector, officialLoginButtonName, rememberedIdentityFromSubmittedDocument, type LoginCapture, type PortalTransport } from "../src/transport.js";
 import { MemoryVault, type Session, type SessionVault } from "../src/vault.js";
 
 const request = { url: `${backendOrigin}${appointmentPath}`, headers: { authorization: "Bearer redacted", channel: "web", idtransaction: "opaque", cookie: "sid=redacted" } };
@@ -34,14 +34,157 @@ const execute = (
   login: (options: { rememberDocument: boolean; identity: { document: string } | null }) => Promise<LoginCapture> = async () => loginResult
 ) => run(args, { vault, transport, login });
 
+function installLoginActivationPage(options: { delayBinding?: boolean } = {}) {
+  class FakeInput { value = "12345678"; }
+  const originalInput = globalThis.HTMLInputElement;
+  const originalWindow = globalThis.window;
+  const input = new FakeInput();
+  let buttonListener: (() => void) | undefined;
+  let keydownListener: ((event: KeyboardEvent) => void) | undefined;
+  let buttonListenerOptions: AddEventListenerOptions | boolean | undefined;
+  let documentListenerOptions: AddEventListenerOptions | boolean | undefined;
+  let binding: ((source: unknown, value: unknown) => boolean | Promise<boolean>) | undefined;
+  let releaseBinding = () => {};
+  const document = {
+    querySelector: (selector: string) => selector === loginDocumentSelector ? input : null,
+    addEventListener: (type: string, listener: (event: KeyboardEvent) => void, listenerOptions?: AddEventListenerOptions | boolean) => {
+      if (type === "keydown") {
+        keydownListener = listener;
+        documentListenerOptions = listenerOptions;
+      }
+    },
+    removeEventListener: () => {},
+  };
+  const button = {
+    ownerDocument: document,
+    addEventListener: (type: string, listener: () => void, listenerOptions?: AddEventListenerOptions | boolean) => {
+      if (type === "click") {
+        buttonListener = listener;
+        buttonListenerOptions = listenerOptions;
+      }
+    },
+    removeEventListener: () => {},
+  };
+  const calls: unknown[] = [];
+  const page = {
+    exposeBinding: async (_name: string, callback: (source: unknown, value: unknown) => boolean | Promise<boolean>) => { binding = callback; },
+    getByRole: (role: string, roleOptions: unknown) => {
+      calls.push(role, roleOptions);
+      return {
+        waitFor: async (waitOptions: unknown) => { calls.push(waitOptions); },
+        evaluate: async (callback: (element: typeof button, selector: string) => void, selector: string) => callback(button, selector),
+      };
+    },
+  };
+  Object.defineProperty(globalThis, "HTMLInputElement", { configurable: true, value: FakeInput });
+  Object.defineProperty(globalThis, "window", {
+    configurable: true,
+    value: {
+      __clinicaiCaptureSubmittedDocument: async (value: string) => {
+        if (!options.delayBinding) return binding?.({}, value) ?? false;
+        return new Promise<boolean>((resolve) => {
+          releaseBinding = async () => resolve(await (binding?.({}, value) ?? false));
+        });
+      },
+    },
+  });
+  return {
+    page,
+    input,
+    calls,
+    get buttonListenerOptions() { return buttonListenerOptions; },
+    get documentListenerOptions() { return documentListenerOptions; },
+    click: () => buttonListener?.(),
+    keydown: (key: string) => keydownListener?.({ key } as KeyboardEvent),
+    get releaseBinding() { return releaseBinding; },
+    restore: () => {
+      Object.defineProperty(globalThis, "HTMLInputElement", { configurable: true, value: originalInput });
+      Object.defineProperty(globalThis, "window", { configurable: true, value: originalWindow });
+    },
+  };
+}
+
 describe("clinicai tracer contract", () => {
-  test("accepts only an opted-in, bounded document submitted from the official input", () => {
+  test("accepts only an opted-in, bounded document captured from the official input", () => {
     expect(loginDocumentSelector).toContain('placeholder="Nro de documento"');
+    expect(officialLoginButtonName).toBe("Ingresar");
     expect(rememberedIdentityFromSubmittedDocument(false, "12345678")).toBeNull();
     expect(rememberedIdentityFromSubmittedDocument(true, "")).toBeNull();
     expect(rememberedIdentityFromSubmittedDocument(true, " ")).toBeNull();
     expect(rememberedIdentityFromSubmittedDocument(true, "1".repeat(65))).toBeNull();
     expect(rememberedIdentityFromSubmittedDocument(true, " 12345678 ")).toEqual({ document: "12345678" });
+  });
+
+  test("captures at the exact official Ingresar click in capture phase", async () => {
+    const activation = installLoginActivationPage();
+    try {
+      const captured = await captureDocumentOnOfficialLoginActivation(activation.page as never, true);
+      activation.click();
+      expect(activation.calls).toEqual(["button", { name: officialLoginButtonName, exact: true }, { state: "visible" }]);
+      expect(activation.buttonListenerOptions).toEqual({ capture: true });
+      expect(await captured()).toEqual({ document: "12345678" });
+    } finally {
+      activation.restore();
+    }
+  });
+
+  test("captures the official document on an Enter keydown at document capture phase", async () => {
+    const activation = installLoginActivationPage();
+    try {
+      const captured = await captureDocumentOnOfficialLoginActivation(activation.page as never, true);
+      activation.keydown("Escape");
+      activation.keydown("Enter");
+      expect(activation.documentListenerOptions).toEqual({ capture: true });
+      expect(await captured()).toEqual({ document: "12345678" });
+    } finally {
+      activation.restore();
+    }
+  });
+
+  test("waits for a delayed asynchronous binding after replay", async () => {
+    const activation = installLoginActivationPage({ delayBinding: true });
+    try {
+      const captured = await captureDocumentOnOfficialLoginActivation(activation.page as never, true, 100);
+      activation.click();
+      const result = captured();
+      activation.releaseBinding();
+      expect(await result).toEqual({ document: "12345678" });
+    } finally {
+      activation.restore();
+    }
+  });
+
+  test("keeps the first valid official activation when click and Enter both fire", async () => {
+    const activation = installLoginActivationPage();
+    try {
+      const captured = await captureDocumentOnOfficialLoginActivation(activation.page as never, true);
+      activation.click();
+      activation.input.value = "87654321";
+      activation.keydown("Enter");
+      expect(await captured()).toEqual({ document: "12345678" });
+    } finally {
+      activation.restore();
+    }
+  });
+
+  test("does not bind document capture when remembering is opted out", async () => {
+    const page = {
+      exposeBinding: () => { throw new Error("should not bind"); },
+      getByRole: () => { throw new Error("should not locate"); },
+    };
+    expect(await (await captureDocumentOnOfficialLoginActivation(page as never, false))()).toBeNull();
+  });
+
+  test("returns null after a bounded wait when no official activation is captured", async () => {
+    const activation = installLoginActivationPage();
+    try {
+      const captured = await captureDocumentOnOfficialLoginActivation(activation.page as never, true, 10);
+      const started = Date.now();
+      expect(await captured()).toBeNull();
+      expect(Date.now() - started).toBeLessThan(250);
+    } finally {
+      activation.restore();
+    }
   });
 
   test("emits an empty observed envelope with redacted remembered identity", async () => {
@@ -256,10 +399,17 @@ describe("clinicai tracer contract", () => {
   });
 
   test("does not persist a login when artifact capture/replay is unsupported", async () => {
-    const vault = new MemoryVault();
+    class ObservedVault extends MemoryVault {
+      writes: string[] = [];
+      async writeSession(value: Session) { this.writes.push("session"); await super.writeSession(value); }
+      async writeIdentity(value: { document: string }) { this.writes.push("identity"); await super.writeIdentity(value); }
+    }
+    const vault = new ObservedVault();
     const result = await execute(["auth", "login"], vault, new FakeTransport(), async () => { throw new CliError("AUTH_ARTIFACT_UNSUPPORTED"); });
     expect(result.stderr).toBe("AUTH_ARTIFACT_UNSUPPORTED\n");
     expect(await vault.readSession()).toBeNull();
+    expect(await vault.readIdentity()).toBeNull();
+    expect(vault.writes).toEqual([]);
   });
 
   test("remembers only an explicitly opted-in document and supports forgetting it", async () => {
@@ -271,6 +421,18 @@ describe("clinicai tracer contract", () => {
     expect(await vault.readIdentity()).toEqual({ document: "12345678" });
     expect((await execute(["auth", "forget-document"], vault)).stdout).toBe('{"ok":true,"status":"document_forgotten"}\n');
     expect(await vault.readIdentity()).toBeNull();
+  });
+
+  test("writes the remembered identity only after a successful login capture", async () => {
+    class OrderedVault extends MemoryVault {
+      writes: string[] = [];
+      async writeSession(value: Session) { this.writes.push("session"); await super.writeSession(value); }
+      async writeIdentity(value: { document: string }) { this.writes.push("identity"); await super.writeIdentity(value); }
+    }
+    const vault = new OrderedVault();
+    const login = async (): Promise<LoginCapture> => ({ session, rememberedIdentity: { document: "12345678" } });
+    expect((await execute(["auth", "login", "--remember-document"], vault, new FakeTransport(), login)).exitCode).toBe(0);
+    expect(vault.writes).toEqual(["session", "identity"]);
   });
 
   test("logout is idempotent and attempts both deletes when one vault operation fails", async () => {

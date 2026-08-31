@@ -11,13 +11,16 @@ export const frontendOrigin = "https://citasenlinea.clinicainternacional.com.pe"
 export const backendOrigin = "https://prdexp.clinicainternacional.com.pe";
 export const loginPath = "/authentication/login/login-first-step";
 export const appointmentPath = "/v2/appointments/appointmentslist";
+/** Exact accessible name of the visible official login control. */
+export const officialLoginButtonName = "Ingresar";
 const loginUrl = `${frontendOrigin}${loginPath}`;
 const replayHeaderNames = new Set(["authorization", "cookie", "channel", "idtransaction"]);
 const maxRememberedDocumentLength = 64;
 const appointmentsCaptureTimeout = 120_000;
+const documentCaptureTimeout = 1_000;
 export const loginDocumentSelector = 'input[placeholder="Nro de documento"]';
 
-/** Accepts only the explicitly opted-in document submitted through the login form. */
+/** Accepts only the explicitly opted-in document captured at official login activation. */
 export function rememberedIdentityFromSubmittedDocument(rememberDocument: boolean, value: unknown): RememberedIdentity | null {
   if (!rememberDocument || typeof value !== "string") return null;
   const document = value.trim();
@@ -55,19 +58,52 @@ async function prefillDocument(page: Page, identity: RememberedIdentity | null):
   if (await input.count()) await input.fill(identity.document);
 }
 
-async function captureDocumentWhenSubmitted(page: Page, rememberDocument: boolean): Promise<() => RememberedIdentity | null> {
-  let identity: RememberedIdentity | null = null;
+export async function captureDocumentOnOfficialLoginActivation(
+  page: Page,
+  rememberDocument: boolean,
+  timeout = documentCaptureTimeout,
+): Promise<() => Promise<RememberedIdentity | null>> {
+  if (!rememberDocument) return async () => null;
+
+  let captured = false;
+  let resolveCaptured!: (identity: RememberedIdentity) => void;
+  const capturedIdentity = new Promise<RememberedIdentity>((resolve) => { resolveCaptured = resolve; });
   await page.exposeBinding("__clinicaiCaptureSubmittedDocument", (_source, value: unknown) => {
-    identity = rememberedIdentityFromSubmittedDocument(rememberDocument, value);
+    if (captured) return false;
+    const identity = rememberedIdentityFromSubmittedDocument(rememberDocument, value);
+    if (!identity) return false;
+    captured = true;
+    resolveCaptured(identity);
+    return true;
   });
-  await page.locator(loginDocumentSelector).evaluate((input) => {
-    if (!(input instanceof HTMLInputElement)) return;
-    input.form?.addEventListener("submit", () => {
-      void (window as typeof window & { __clinicaiCaptureSubmittedDocument: (value: string) => Promise<void> })
+  const button = page.getByRole("button", { name: officialLoginButtonName, exact: true });
+  await button.waitFor({ state: "visible" });
+  await button.evaluate((element, selector) => {
+    const document = element.ownerDocument;
+    type CaptureBinding = (value: string) => Promise<boolean>;
+    const capture = async () => {
+      const input = document.querySelector(selector);
+      if (!(input instanceof HTMLInputElement)) return;
+      const accepted = await (window as typeof window & { __clinicaiCaptureSubmittedDocument: CaptureBinding })
         .__clinicaiCaptureSubmittedDocument(input.value);
-    }, { once: true });
-  });
-  return () => identity;
+      if (!accepted) return;
+      element.removeEventListener("click", onClick, true);
+      document.removeEventListener("keydown", onKeydown, true);
+    };
+    const onClick = () => { void capture(); };
+    const onKeydown = (event: KeyboardEvent) => {
+      if (event.key === "Enter") void capture();
+    };
+    element.addEventListener("click", onClick, { capture: true });
+    document.addEventListener("keydown", onKeydown, { capture: true });
+  }, loginDocumentSelector);
+  return async () => {
+    if (captured) return capturedIdentity;
+    return Promise.race([
+      capturedIdentity,
+      new Promise<null>((resolve) => { setTimeout(resolve, timeout, null); }),
+    ]);
+  };
 }
 
 type ActivatedCapture<T> = {
@@ -160,7 +196,7 @@ export async function observeLogin(options: { rememberDocument: boolean; identit
   try {
     await page.goto(loginUrl, { waitUntil: "domcontentloaded" });
     await prefillDocument(page, options.identity);
-    const submittedIdentity = await captureDocumentWhenSubmitted(page, options.rememberDocument);
+    const submittedIdentity = await captureDocumentOnOfficialLoginActivation(page, options.rememberDocument);
     const misCitas = page.getByText("Mis citas", { exact: true }).first();
     const response = await captureAfterAuthenticatedActivation({
       waitForAuthenticatedControl: () => misCitas.waitFor({ state: "visible", timeout: 0 }),
@@ -175,7 +211,7 @@ export async function observeLogin(options: { rememberDocument: boolean; identit
     const session: Session = { version: 1, request: await captureRequest(response.request(), context) };
     // Browser and context deliberately remain open until this direct replay proves the artifact.
     await new DirectHttpTransport(options.replay).listAppointments(session);
-    return { session, rememberedIdentity: submittedIdentity() };
+    return { session, rememberedIdentity: await submittedIdentity() };
   } catch (error) {
     if (error instanceof CliError) throw error;
     throw new CliError("LOGIN_NOT_COMPLETED");
