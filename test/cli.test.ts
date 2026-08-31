@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { run } from "../src/app.js";
 import { CliError } from "../src/errors.js";
 import { compareAppointments, parseAppointmentsEnvelope } from "../src/parser.js";
-import { DirectHttpTransport, backendOrigin, appointmentPath, captureAfterAuthenticatedActivation, captureDocumentOnOfficialLoginActivation, captureReplayRequest, loginDocumentSelector, officialLoginButtonName, rememberedIdentityFromSubmittedDocument, type LoginCapture, type PortalTransport } from "../src/transport.js";
+import { DirectHttpTransport, backendOrigin, appointmentPath, captureAfterAuthenticatedActivation, captureDocumentOnOfficialLoginActivation, captureReplayRequest, loginDocumentSelector, officialLoginButtonName, readRememberedIdentityFromSessionStorage, rememberedIdentityFromAuthenticatedPair, rememberedIdentityFromSubmittedDocument, type LoginCapture, type PortalTransport } from "../src/transport.js";
 import { MemoryVault, type Session, type SessionVault } from "../src/vault.js";
 
 const request = { url: `${backendOrigin}${appointmentPath}`, headers: { authorization: "Bearer redacted", channel: "web", idtransaction: "opaque", cookie: "sid=redacted" } };
@@ -115,6 +115,30 @@ describe("clinicai tracer contract", () => {
     expect(rememberedIdentityFromSubmittedDocument(true, " 12345678 ")).toEqual({ document: "12345678" });
   });
 
+  test("accepts only an opted-in, bounded authenticated pair with both non-empty bounded strings", () => {
+    // Opted out: never persists the pair.
+    expect(rememberedIdentityFromAuthenticatedPair(false, "12345678", "1")).toBeNull();
+    // Empty or whitespace document.
+    expect(rememberedIdentityFromAuthenticatedPair(true, "", "1")).toBeNull();
+    expect(rememberedIdentityFromAuthenticatedPair(true, " ", "1")).toBeNull();
+    // Empty or whitespace documentType.
+    expect(rememberedIdentityFromAuthenticatedPair(true, "12345678", "")).toBeNull();
+    expect(rememberedIdentityFromAuthenticatedPair(true, "12345678", " ")).toBeNull();
+    // Bounded document (<=64) and documentType (<=16).
+    expect(rememberedIdentityFromAuthenticatedPair(true, "1".repeat(65), "1")).toBeNull();
+    expect(rememberedIdentityFromAuthenticatedPair(true, "12345678", "1".repeat(17))).toBeNull();
+    // Non-string or null/undefined values.
+    expect(rememberedIdentityFromAuthenticatedPair(true, 12345678, "1")).toBeNull();
+    expect(rememberedIdentityFromAuthenticatedPair(true, "12345678", 1)).toBeNull();
+    expect(rememberedIdentityFromAuthenticatedPair(true, null, "1")).toBeNull();
+    expect(rememberedIdentityFromAuthenticatedPair(true, "12345678", null)).toBeNull();
+    expect(rememberedIdentityFromAuthenticatedPair(true, undefined, "1")).toBeNull();
+    expect(rememberedIdentityFromAuthenticatedPair(true, "12345678", undefined)).toBeNull();
+    // Happy path: exact authenticated pair, both values trimmed.
+    expect(rememberedIdentityFromAuthenticatedPair(true, "12345678", "1")).toEqual({ document: "12345678", documentType: "1" });
+    expect(rememberedIdentityFromAuthenticatedPair(true, " 12345678 ", " 1 ")).toEqual({ document: "12345678", documentType: "1" });
+  });
+
   test("captures at the exact official Ingresar click in capture phase", async () => {
     const activation = installLoginActivationPage();
     try {
@@ -185,6 +209,51 @@ describe("clinicai tracer contract", () => {
     } finally {
       activation.restore();
     }
+  });
+
+  test("reads the exact authenticated pair from sessionStorage with opt-out and invalid fallbacks", async () => {
+    const originalSessionStorage = Object.getOwnPropertyDescriptor(globalThis, "sessionStorage");
+    const installSessionStorage = (values: Record<string, string | null>) => {
+      Object.defineProperty(globalThis, "sessionStorage", {
+        configurable: true,
+        value: { getItem: (key: string) => key in values ? values[key] : null },
+      });
+    };
+    const page = { evaluate: async <T>(fn: () => T) => fn() };
+    try {
+      // Happy path: exact authenticated pair present in sessionStorage.
+      installSessionStorage({ documentNumber: "12345678", documentType: "1" });
+      expect(await readRememberedIdentityFromSessionStorage(page as never, true)).toEqual({ document: "12345678", documentType: "1" });
+      // Opt-out: rememberDocument=false never reads or persists the pair.
+      expect(await readRememberedIdentityFromSessionStorage(page as never, false)).toBeNull();
+      // Invalid: documentNumber missing from sessionStorage.
+      installSessionStorage({ documentType: "1" });
+      expect(await readRememberedIdentityFromSessionStorage(page as never, true)).toBeNull();
+      // Invalid: documentType missing from sessionStorage.
+      installSessionStorage({ documentNumber: "12345678" });
+      expect(await readRememberedIdentityFromSessionStorage(page as never, true)).toBeNull();
+      // Invalid: documentType exceeds the bounded length.
+      installSessionStorage({ documentNumber: "12345678", documentType: "1".repeat(17) });
+      expect(await readRememberedIdentityFromSessionStorage(page as never, true)).toBeNull();
+      // Invalid: document exceeds the bounded length.
+      installSessionStorage({ documentNumber: "1".repeat(65), documentType: "1" });
+      expect(await readRememberedIdentityFromSessionStorage(page as never, true)).toBeNull();
+    } finally {
+      if (originalSessionStorage) Object.defineProperty(globalThis, "sessionStorage", originalSessionStorage);
+      else delete (globalThis as Record<string, unknown>).sessionStorage;
+    }
+  });
+
+  test("returns null when page.evaluate throws and never reads sessionStorage when opted out", async () => {
+    // page.evaluate throws on every read: the reader must swallow the failure
+    // and return null so observeLogin can fall back to the activation-captured identity.
+    let evaluateCalls = 0;
+    const throwingPage = { evaluate: async () => { evaluateCalls += 1; throw new Error("sessionStorage unavailable"); } };
+    expect(await readRememberedIdentityFromSessionStorage(throwingPage as never, true)).toBeNull();
+    expect(evaluateCalls).toBe(1);
+    // Opt-out: page.evaluate must not be invoked at all.
+    const optOutPage = { evaluate: async () => { throw new Error("should not evaluate"); } };
+    expect(await readRememberedIdentityFromSessionStorage(optOutPage as never, false)).toBeNull();
   });
 
   test("emits an empty observed envelope with redacted remembered identity", async () => {
@@ -450,11 +519,11 @@ describe("clinicai tracer contract", () => {
 
   test("remembers only an explicitly opted-in document and supports forgetting it", async () => {
     const vault = new MemoryVault();
-    const login = async ({ rememberDocument }: { rememberDocument: boolean }): Promise<LoginCapture> => ({ session, rememberedIdentity: rememberDocument ? { document: "12345678" } : null });
+    const login = async ({ rememberDocument }: { rememberDocument: boolean }): Promise<LoginCapture> => ({ session, rememberedIdentity: rememberDocument ? { document: "12345678", documentType: "1" } : null });
     expect((await execute(["auth", "login"], vault, new FakeTransport(), login)).exitCode).toBe(0);
     expect(await vault.readIdentity()).toBeNull();
     expect((await execute(["auth", "login", "--remember-document"], vault, new FakeTransport(), login)).stdout).toBe('{"ok":true,"status":"logged_in"}\n');
-    expect(await vault.readIdentity()).toEqual({ document: "12345678" });
+    expect(await vault.readIdentity()).toEqual({ document: "12345678", documentType: "1" });
     expect((await execute(["auth", "forget-document"], vault)).stdout).toBe('{"ok":true,"status":"document_forgotten"}\n');
     expect(await vault.readIdentity()).toBeNull();
   });

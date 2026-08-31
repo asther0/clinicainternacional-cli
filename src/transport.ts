@@ -16,6 +16,7 @@ export const officialLoginButtonName = "Ingresar";
 const loginUrl = `${frontendOrigin}${loginPath}`;
 const replayHeaderNames = new Set(["authorization", "cookie", "channel", "idtransaction"]);
 const maxRememberedDocumentLength = 64;
+const maxRememberedDocumentTypeLength = 16;
 const appointmentsCaptureTimeout = 120_000;
 const documentCaptureTimeout = 1_000;
 export const loginDocumentSelector = 'input[placeholder="Nro de documento"]';
@@ -26,6 +27,48 @@ export function rememberedIdentityFromSubmittedDocument(rememberDocument: boolea
   const document = value.trim();
   if (!document || document.length > maxRememberedDocumentLength) return null;
   return { document };
+}
+
+/**
+ * Accepts only the explicitly opted-in pair read from sessionStorage after a
+ * successful direct replay. Both values must be non-empty bounded strings:
+ * document <= 64, documentType <= 16. Old keychain identities with only
+ * document remain readable because documentType is optional.
+ */
+export function rememberedIdentityFromAuthenticatedPair(
+  rememberDocument: boolean,
+  document: unknown,
+  documentType: unknown,
+): RememberedIdentity | null {
+  if (!rememberDocument || typeof document !== "string" || typeof documentType !== "string") return null;
+  const trimmedDocument = document.trim();
+  const trimmedType = documentType.trim();
+  if (!trimmedDocument || trimmedDocument.length > maxRememberedDocumentLength) return null;
+  if (!trimmedType || trimmedType.length > maxRememberedDocumentTypeLength) return null;
+  return { document: trimmedDocument, documentType: trimmedType };
+}
+
+/**
+ * Reads only sessionStorage.getItem('documentNumber') and getItem('documentType')
+ * via page.evaluate, then validates the pair. Opts out by returning null without
+ * ever calling page.evaluate. A page.evaluate read failure is swallowed and
+ * returns null so observeLogin can fall back to the activation-captured identity.
+ */
+export async function readRememberedIdentityFromSessionStorage(
+  page: Page,
+  rememberDocument: boolean,
+): Promise<RememberedIdentity | null> {
+  if (!rememberDocument) return null;
+  let pair: { document: string | null; documentType: string | null };
+  try {
+    pair = await page.evaluate(() => ({
+      document: sessionStorage.getItem("documentNumber"),
+      documentType: sessionStorage.getItem("documentType"),
+    }));
+  } catch {
+    return null;
+  }
+  return rememberedIdentityFromAuthenticatedPair(rememberDocument, pair.document, pair.documentType);
 }
 
 function validatedUrl(value: string): URL {
@@ -242,7 +285,10 @@ export async function observeLogin(options: { rememberDocument: boolean; identit
     const session: Session = { version: 1, request: await captureRequest(response.request(), context) };
     // Browser and context deliberately remain open until this direct replay proves the artifact.
     await new DirectHttpTransport(options.replay).listAppointments(session);
-    return { session, rememberedIdentity: await submittedIdentity() };
+    // After successful replay, prefer the validated authenticated pair from sessionStorage;
+    // fall back to the activation-captured document for compatibility with old keychain identities.
+    const authenticated = await readRememberedIdentityFromSessionStorage(page, options.rememberDocument);
+    return { session, rememberedIdentity: authenticated ?? await submittedIdentity() };
   } catch (error) {
     if (error instanceof CliError) throw error;
     throw new CliError("LOGIN_NOT_COMPLETED");

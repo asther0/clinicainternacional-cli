@@ -3,7 +3,7 @@ import { CliError } from "./errors.js";
 
 export type CapturedRequest = { url: string; headers: Record<string, string> };
 export type Session = { version: 1; request: CapturedRequest };
-export type RememberedIdentity = { document: string };
+export type RememberedIdentity = { document: string; documentType?: string };
 
 export interface SessionVault {
   readSession(): Promise<Session | null>;
