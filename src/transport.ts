@@ -165,6 +165,36 @@ async function validateObservedAppointmentsResponse(response: import("playwright
   }
 }
 
+const expiredAuditKeys = ["date", "idTransaction", "methodName", "responseCode", "responseMessage", "serviceName"] as const;
+const expiredResponseCode = "-1";
+const expiredResponseMessage = "Sesion expirada o no encontrada";
+
+/**
+ * Exact audit envelope the portal uses to signal an expired/missing session
+ * inside an HTTP 200 body. Any drift (wrong code, different message, missing
+ * or extra audit key, non-null bodyResponse) is a near miss and stays
+ * PORTAL_CONTRACT_CHANGED via parseAppointmentsEnvelope.
+ */
+function isExactSessionExpiredPayload(payload: unknown): boolean {
+  if (typeof payload !== "object" || payload === null || Array.isArray(payload)) return false;
+  const record = payload as Record<string, unknown>;
+  const topKeys = Object.keys(record);
+  if (topKeys.length !== 2) return false;
+  if (!topKeys.includes("auditResponse") || !topKeys.includes("bodyResponse")) return false;
+  const audit = record.auditResponse;
+  if (typeof audit !== "object" || audit === null || Array.isArray(audit)) return false;
+  const auditRecord = audit as Record<string, unknown>;
+  const keys = Object.keys(auditRecord);
+  if (keys.length !== expiredAuditKeys.length) return false;
+  for (const expected of expiredAuditKeys) {
+    if (!keys.includes(expected) || typeof auditRecord[expected] !== "string") return false;
+  }
+  if (auditRecord.responseCode !== expiredResponseCode) return false;
+  if (auditRecord.responseMessage !== expiredResponseMessage) return false;
+  if (record.bodyResponse !== null) return false;
+  return true;
+}
+
 /** Exact, minimal direct replay. It never invokes browser automation as a fallback. */
 export class DirectHttpTransport implements PortalTransport {
   constructor(private readonly request: FetchLike = fetch) {}
@@ -179,6 +209,7 @@ export class DirectHttpTransport implements PortalTransport {
     } catch {
       throw new CliError("PORTAL_CONTRACT_CHANGED");
     }
+    if (isExactSessionExpiredPayload(payload)) throw new CliError("AUTH_REQUIRED");
     try {
       parseAppointmentsEnvelope(payload);
     } catch {

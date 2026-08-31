@@ -339,6 +339,23 @@ describe("clinicai tracer contract", () => {
     await expect(new DirectHttpTransport(async () => new Response(JSON.stringify({ bodyResponse: { appointmentsNumber: 1, list: [{}] } }), { status: 200 })).listAppointments(session)).rejects.toMatchObject({ code: "PORTAL_CONTRACT_CHANGED" });
   });
 
+  test("keeps extra top-level keys on the session-expired envelope as a contract mismatch", async () => {
+    const expiredWithExtra = {
+      auditResponse: {
+        idTransaction: "opaque-tx",
+        serviceName: "opaque-svc",
+        methodName: "opaque-method",
+        date: "1970-01-01T00:00:00Z",
+        responseCode: "-1",
+        responseMessage: "Sesion expirada o no encontrada",
+      },
+      bodyResponse: null,
+      extra: "leak",
+    };
+    const transport = new DirectHttpTransport(async () => new Response(JSON.stringify(expiredWithExtra), { status: 200 }));
+    await expect(transport.listAppointments(session)).rejects.toMatchObject({ code: "PORTAL_CONTRACT_CHANGED" });
+  });
+
   test("captures only the strict replay header allowlist and requires observed artifacts", () => {
     expect(captureReplayRequest(`${backendOrigin}${appointmentPath}`, {
       Channel: "web", IdTransaction: "opaque", Authorization: "Bearer secret", Cookie: "sid=secret", Referer: "discard", "x-extra": "discard"
@@ -350,6 +367,25 @@ describe("clinicai tracer contract", () => {
   test("invalidates the saved session before reporting an authorization failure", async () => {
     const vault = new MemoryVault(session);
     const result = await execute(["appointments", "list"], vault, new FakeTransport(empty, new CliError("AUTH_REQUIRED")));
+    expect(result.stderr).toBe("AUTH_REQUIRED\n");
+    expect(await vault.readSession()).toBeNull();
+  });
+
+  test("treats the exact audited session-expired envelope as auth required", async () => {
+    const vault = new MemoryVault(session);
+    const expired = {
+      auditResponse: {
+        idTransaction: "opaque-tx",
+        serviceName: "opaque-svc",
+        methodName: "opaque-method",
+        date: "1970-01-01T00:00:00Z",
+        responseCode: "-1",
+        responseMessage: "Sesion expirada o no encontrada",
+      },
+      bodyResponse: null,
+    };
+    const transport = new DirectHttpTransport(async () => new Response(JSON.stringify(expired), { status: 200 }));
+    const result = await execute(["appointments", "list"], vault, transport);
     expect(result.stderr).toBe("AUTH_REQUIRED\n");
     expect(await vault.readSession()).toBeNull();
   });
