@@ -7,6 +7,9 @@
   "permission": {
     "external_directory": {
       "/Users/asther0/Desktop/JHOMAR_LAB/asther0 vault/30 projects/side/ClinicaInternacionalCLI/**": "allow"
+    },
+    "bash": {
+      "node dist/cli.js auth login *": "allow"
     }
   }
 }
