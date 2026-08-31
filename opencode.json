@@ -9,7 +9,8 @@
       "/Users/asther0/Desktop/JHOMAR_LAB/asther0 vault/30 projects/side/ClinicaInternacionalCLI/**": "allow"
     },
     "bash": {
-      "node dist/cli.js auth login *": "allow"
+      "node dist/cli.js auth login *": "allow",
+      "/Users/asther0/Desktop/JHOMAR_LAB/asther0 vault/00 meta/bin/herdr-route-agent.sh git-ops *": "allow"
     }
   }
 }
