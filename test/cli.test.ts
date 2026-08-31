@@ -1,9 +1,9 @@
 import { describe, expect, test } from "bun:test";
 import { run } from "../src/app.js";
 import { CliError } from "../src/errors.js";
-import { compareAppointments, parseAppointmentsEnvelope } from "../src/parser.js";
-import { DirectHttpTransport, backendOrigin, appointmentPath, captureAfterAuthenticatedActivation, captureDocumentOnOfficialLoginActivation, captureReplayRequest, loginDocumentSelector, officialLoginButtonName, readRememberedIdentityFromSessionStorage, rememberedIdentityFromAuthenticatedPair, rememberedIdentityFromSubmittedDocument, type LoginCapture, type PortalTransport } from "../src/transport.js";
-import { MemoryVault, type Session, type SessionVault } from "../src/vault.js";
+import { compareAppointments, parseAppointmentsEnvelope, parseFamilies, parsePatients, parseProfile } from "../src/parser.js";
+import { DirectHttpTransport, backendOrigin, appointmentPath, captureAfterAuthenticatedActivation, captureDocumentOnOfficialLoginActivation, captureReplayRequest, familiesPath, loginDocumentSelector, officialLoginButtonName, profilePath, readRememberedIdentityFromSessionStorage, rememberedIdentityFromAuthenticatedPair, rememberedIdentityFromSubmittedDocument, type LoginCapture, type PortalTransport } from "../src/transport.js";
+import { MemoryVault, type RememberedIdentity, type Session, type SessionVault } from "../src/vault.js";
 
 const request = { url: `${backendOrigin}${appointmentPath}`, headers: { authorization: "Bearer redacted", channel: "web", idtransaction: "opaque", cookie: "sid=redacted" } };
 const session: Session = { version: 1, request };
@@ -24,6 +24,7 @@ const auditedEmpty = {
 class FakeTransport implements PortalTransport {
   constructor(private readonly data: unknown = empty, private readonly failure?: CliError) {}
   async listAppointments() { if (this.failure) throw this.failure; return this.data; }
+  async listPatients(): Promise<{ profile: unknown; families: unknown }> { throw new Error("not used"); }
 }
 
 const loginResult: LoginCapture = { session, rememberedIdentity: null };
@@ -576,6 +577,294 @@ describe("clinicai tracer contract", () => {
     expect(result.stderr).toBe("PORTAL_CONTRACT_CHANGED\n");
     expect(result.stdout).toBe('{"error":{"code":"PORTAL_CONTRACT_CHANGED","message":"The portal response no longer matches the supported contract."},"ok":false}\n');
     expect(result.exitCode).toBe(1);
+  });
+
+  test("patients list requires session, then identity with documentType, before doing any work", async () => {
+    // No session: AUTH_REQUIRED (identity is irrelevant at this layer).
+    const noSession = new MemoryVault();
+    expect((await execute(["patients", "list"], noSession)).stderr).toBe("AUTH_REQUIRED\n");
+    // Session but no identity: IDENTITY_REQUIRED.
+    const sessionOnly = new MemoryVault(session);
+    expect((await execute(["patients", "list"], sessionOnly)).stderr).toBe("IDENTITY_REQUIRED\n");
+    // Identity with document but no documentType: IDENTITY_REQUIRED, message directs --remember-document.
+    const missingType = new MemoryVault({ ...session, document: "12345678" });
+    const missingResult = await execute(["patients", "list"], missingType);
+    expect(missingResult.stderr).toBe("IDENTITY_REQUIRED\n");
+    expect(missingResult.stdout).toBe('{"error":{"code":"IDENTITY_REQUIRED","message":"A remembered document with type is required. Run clinicai auth login --remember-document."},"ok":false}\n');
+  });
+
+  test("MemoryVault constructor preserves the optional documentType from the seed", async () => {
+    const withType = new MemoryVault({ ...session, document: "12345678", documentType: "1" });
+    expect(await withType.readIdentity()).toEqual({ document: "12345678", documentType: "1" });
+    const withoutType = new MemoryVault({ ...session, document: "12345678" });
+    expect(await withoutType.readIdentity()).toEqual({ document: "12345678" });
+    const empty = new MemoryVault(null);
+    expect(await empty.readIdentity()).toBeNull();
+  });
+
+  test("patients list emits the observed holder-only public output with redacted contract fields", async () => {
+    const remembered: RememberedIdentity = { document: "12345678", documentType: "1" };
+    const vault = new MemoryVault({ ...session, document: remembered.document, documentType: remembered.documentType });
+    const calls: Array<{ input: string; init: RequestInit }> = [];
+    const validAudit = {
+      idTransaction: "opaque-tx",
+      serviceName: "opaque-svc",
+      methodName: "opaque-method",
+      date: "1970-01-01T00:00:00Z",
+      responseCode: "0",
+      responseMessage: "ok",
+    };
+    const profileFixture = {
+      auditResponse: { ...validAudit },
+      bodyResponse: {
+        patient: {
+          documentNumber: "12345678",
+          documentType: "1",
+          names: "Juan",
+          lastName: "Perez",
+          lastName2: "Gomez",
+          phone: "987654321",
+          email: "juan@example.com",
+          internalId: "internal-leak",
+          address: "redacted address",
+          insurer: "redacted insurer",
+          token: "redacted token",
+        },
+        liveWell: { internalFlag: "x", internalScore: 42 },
+      },
+    };
+    const familiesFixture = {
+      auditResponse: { ...validAudit, responseCode: "1" },
+      bodyResponse: { holderNames: null, families: [] },
+    };
+    const transport = new DirectHttpTransport(async (input, init) => {
+      calls.push({ input, init });
+      const method = (init.method ?? "GET").toUpperCase();
+      return new Response(JSON.stringify(method === "POST" ? profileFixture : familiesFixture), { status: 200, headers: { "content-type": "application/json" } });
+    });
+    const result = await execute(["patients", "list"], vault, transport);
+    // Exact request assertions: two calls in order, exact headers, exact POST body.
+    expect(calls).toHaveLength(2);
+    expect(calls[0]).toEqual({
+      input: `${backendOrigin}${profilePath}`,
+      init: {
+        method: "POST",
+        headers: { ...request.headers, "content-type": "application/json" },
+        body: JSON.stringify({ documentNumber: "12345678", documentType: "1", idPatientHolder: false }),
+      },
+    });
+    expect(calls[1]).toEqual({
+      input: `${backendOrigin}${familiesPath}`,
+      init: { method: "GET", headers: { ...request.headers, "content-type": "application/json" } },
+    });
+    // Exact public output: one holder with assembled name and digits-only last3.
+    expect(result.stdout).toBe('{"ok":true,"patients":[{"ref":"holder","name":"Juan Perez Gomez","documentLast3":"678","relationship":"self"}]}\n');
+    // Redaction assertions: nothing internal or audit-related leaks. The
+    // assembled name legitimately contains "Gomez" and the wrapper key is
+    // "patients" (which contains "patient" as a substring), so neither is
+    // forbidden here.
+    for (const forbidden of ["auditResponse", "idTransaction", "serviceName", "methodName", "responseCode", "responseMessage", "liveWell", "families", "holderNames", "phone", "987654321", "email", "juan@example.com", "internalId", "internal-leak", "address", "insurer", "token", "internalFlag", "internalScore", "12345678"]) {
+      expect(result.stdout).not.toContain(forbidden);
+    }
+    expect(result.stderr).toBe("");
+    expect(result.exitCode).toBe(0);
+  });
+
+  test("patients list normalizes whitespace and empty name parts when assembling the holder name", () => {
+    const validAudit = {
+      idTransaction: "opaque-tx",
+      serviceName: "opaque-svc",
+      methodName: "opaque-method",
+      date: "1970-01-01T00:00:00Z",
+      responseCode: "0",
+      responseMessage: "ok",
+    };
+    const profile = {
+      auditResponse: validAudit,
+      bodyResponse: {
+        patient: { documentNumber: " 12-345-678 ", documentType: "1", names: "  Maria   Jose ", lastName: "  Lopez ", lastName2: "" },
+        liveWell: {},
+      },
+    };
+    const families = {
+      auditResponse: { ...validAudit, responseCode: "1" },
+      bodyResponse: { holderNames: null, families: [] },
+    };
+    expect(parsePatients(profile, families, { document: " 12-345-678 ", documentType: "1" })).toEqual({
+      ok: true,
+      patients: [{ ref: "holder", name: "Maria Jose Lopez", documentLast3: "678", relationship: "self" }],
+    });
+  });
+
+  test("patients list fails closed on profile document/type identity mismatch with IDENTITY_REQUIRED", () => {
+    const validAudit = {
+      idTransaction: "opaque-tx",
+      serviceName: "opaque-svc",
+      methodName: "opaque-method",
+      date: "1970-01-01T00:00:00Z",
+      responseCode: "0",
+      responseMessage: "ok",
+    };
+    const profile = {
+      auditResponse: validAudit,
+      bodyResponse: {
+        patient: { documentNumber: "12345678", documentType: "1", names: "Juan", lastName: "Perez", lastName2: "Gomez" },
+        liveWell: {},
+      },
+    };
+    const families = {
+      auditResponse: { ...validAudit, responseCode: "1" },
+      bodyResponse: { holderNames: null, families: [] },
+    };
+    expect(() => parsePatients(profile, families, { document: "99999999", documentType: "1" })).toThrow(new CliError("IDENTITY_REQUIRED"));
+    expect(() => parsePatients(profile, families, { document: "12345678", documentType: "2" })).toThrow(new CliError("IDENTITY_REQUIRED"));
+  });
+
+  test("parseProfile accepts only the exact observed envelope and required patient strings", () => {
+    const validAudit = {
+      idTransaction: "opaque-tx",
+      serviceName: "opaque-svc",
+      methodName: "opaque-method",
+      date: "1970-01-01T00:00:00Z",
+      responseCode: "0",
+      responseMessage: "ok",
+    };
+    // Happy path: extra patient/liveWell fields are allowed but never returned.
+    const out = parseProfile({
+      auditResponse: validAudit,
+      bodyResponse: {
+        patient: { documentNumber: "12345678", documentType: "1", names: "Juan", lastName: "Perez", lastName2: "Gomez", phone: "9", insurer: "x" },
+        liveWell: { flag: true },
+      },
+    });
+    expect(out).toEqual({ documentNumber: "12345678", documentType: "1", names: "Juan", lastName: "Perez", lastName2: "Gomez" });
+    // Returns must never carry extra keys.
+    expect(Object.keys(out).sort()).toEqual(["documentNumber", "documentType", "lastName", "lastName2", "names"]);
+    // Unordered bodyResponse keys are accepted (exactKeys is order-independent).
+    expect(parseProfile({
+      auditResponse: validAudit,
+      bodyResponse: { liveWell: { flag: true }, patient: { documentNumber: "x", documentType: "1", names: "n", lastName: "l", lastName2: "l2" } },
+    })).toEqual({ documentNumber: "x", documentType: "1", names: "n", lastName: "l", lastName2: "l2" });
+    // Near-miss rejections (PORTAL_CONTRACT_CHANGED).
+    const cases: unknown[] = [
+      null,
+      "string",
+      { auditResponse: validAudit },
+      { bodyResponse: { patient: {}, liveWell: {} } },
+      { auditResponse: validAudit, bodyResponse: { patient: {}, liveWell: {} }, extra: "leak" },
+      { auditResponse: validAudit, bodyResponse: { patient: {}, liveWell: {} } },
+      { auditResponse: { ...validAudit, responseCode: "1" }, bodyResponse: { patient: {}, liveWell: {} } },
+      { auditResponse: { ...validAudit, idTransaction: undefined }, bodyResponse: { patient: {}, liveWell: {} } },
+      { auditResponse: { ...validAudit, responseCode: 0 }, bodyResponse: { patient: {}, liveWell: {} } },
+      { auditResponse: validAudit, bodyResponse: "not-an-object" },
+      { auditResponse: validAudit, bodyResponse: { patient: "not-an-object", liveWell: {} } },
+      { auditResponse: validAudit, bodyResponse: { patient: { documentNumber: "x", documentType: "1", names: "n", lastName: "l", lastName2: "l2" }, liveWell: "x" } },
+      { auditResponse: validAudit, bodyResponse: { patient: { documentNumber: 1, documentType: "1", names: "n", lastName: "l", lastName2: "l2" }, liveWell: {} } },
+      { auditResponse: validAudit, bodyResponse: { patient: { documentNumber: "x", names: "n", lastName: "l", lastName2: "l2" }, liveWell: {} } },
+      { auditResponse: validAudit, bodyResponse: { patient: { documentNumber: "x", documentType: "1", lastName: "l", lastName2: "l2" }, liveWell: {} } },
+      { auditResponse: validAudit, bodyResponse: { patient: { documentNumber: "x", documentType: "1", names: "n", lastName: "l" }, liveWell: {} } },
+      { auditResponse: validAudit, bodyResponse: { patient: { documentNumber: "x", documentType: "1", names: "n", lastName: "l", lastName2: "l2" } } },
+    ];
+    for (const value of cases) expect(() => parseProfile(value)).toThrow(CliError);
+  });
+
+  test("parseFamilies accepts only the exact observed no-relative form", () => {
+    const validAudit = {
+      idTransaction: "opaque-tx",
+      serviceName: "opaque-svc",
+      methodName: "opaque-method",
+      date: "1970-01-01T00:00:00Z",
+      responseCode: "0",
+      responseMessage: "ok",
+    };
+    // Happy path.
+    expect(parseFamilies({
+      auditResponse: { ...validAudit, responseCode: "1" },
+      bodyResponse: { holderNames: null, families: [] },
+    })).toEqual({ holderNames: null, families: [] });
+    // Unordered bodyResponse keys are accepted (exactKeys is order-independent).
+    expect(parseFamilies({
+      auditResponse: { ...validAudit, responseCode: "1" },
+      bodyResponse: { families: [], holderNames: null },
+    })).toEqual({ holderNames: null, families: [] });
+    // Near-miss rejections.
+    const cases: unknown[] = [
+      null,
+      { auditResponse: { ...validAudit, responseCode: "1" }, bodyResponse: { holderNames: null, families: [{}] } },
+      { auditResponse: { ...validAudit, responseCode: "1" }, bodyResponse: { holderNames: "Maria", families: [] } },
+      { auditResponse: { ...validAudit, responseCode: "1" }, bodyResponse: { holderNames: null, families: [], extra: true } },
+      { auditResponse: { ...validAudit, responseCode: "1" }, bodyResponse: { holderNames: null } },
+      { auditResponse: { ...validAudit, responseCode: "0" }, bodyResponse: { holderNames: null, families: [] } },
+      { auditResponse: { ...validAudit, responseCode: "1" }, bodyResponse: "x" },
+      { auditResponse: { ...validAudit, responseCode: "1" }, bodyResponse: null },
+      { bodyResponse: { holderNames: null, families: [] } },
+    ];
+    for (const value of cases) expect(() => parseFamilies(value)).toThrow(CliError);
+  });
+
+  test("patients list transport treats HTTP 401/403 as AUTH_REQUIRED and the app deletes the session", async () => {
+    const transport = new DirectHttpTransport(async () => new Response("forbidden", { status: 403 }));
+    const vault = new MemoryVault({ ...session, document: "12345678", documentType: "1" });
+    const result = await execute(["patients", "list"], vault, transport);
+    expect(result.stderr).toBe("AUTH_REQUIRED\n");
+    expect(await vault.readSession()).toBeNull();
+  });
+
+  test("patients list transport treats the exact audited session-expired envelope as AUTH_REQUIRED and the app deletes the session", async () => {
+    const expired = {
+      auditResponse: {
+        idTransaction: "opaque-tx",
+        serviceName: "opaque-svc",
+        methodName: "opaque-method",
+        date: "1970-01-01T00:00:00Z",
+        responseCode: "-1",
+        responseMessage: "Sesion expirada o no encontrada",
+      },
+      bodyResponse: null,
+    };
+    const transport = new DirectHttpTransport(async () => new Response(JSON.stringify(expired), { status: 200 }));
+    const vault = new MemoryVault({ ...session, document: "12345678", documentType: "1" });
+    const result = await execute(["patients", "list"], vault, transport);
+    expect(result.stderr).toBe("AUTH_REQUIRED\n");
+    expect(await vault.readSession()).toBeNull();
+  });
+
+  test("patients list transport treats non-empty families or drifted patient/family envelopes as PORTAL_CONTRACT_CHANGED", async () => {
+    const validAudit = {
+      idTransaction: "opaque-tx",
+      serviceName: "opaque-svc",
+      methodName: "opaque-method",
+      date: "1970-01-01T00:00:00Z",
+      responseCode: "0",
+      responseMessage: "ok",
+    };
+    const profile = {
+      auditResponse: validAudit,
+      bodyResponse: {
+        patient: { documentNumber: "12345678", documentType: "1", names: "Juan", lastName: "Perez", lastName2: "Gomez" },
+        liveWell: {},
+      },
+    };
+    const driftFamilies = {
+      auditResponse: { ...validAudit, responseCode: "1" },
+      bodyResponse: { holderNames: null, families: [{ name: "relative" }] },
+    };
+    const transport = new DirectHttpTransport(async (_input, init) => {
+      const method = (init.method ?? "GET").toUpperCase();
+      return new Response(JSON.stringify(method === "POST" ? profile : driftFamilies), { status: 200, headers: { "content-type": "application/json" } });
+    });
+    const vault = new MemoryVault({ ...session, document: "12345678", documentType: "1" });
+    const result = await execute(["patients", "list"], vault, transport);
+    expect(result.stderr).toBe("PORTAL_CONTRACT_CHANGED\n");
+    expect(result.exitCode).toBe(1);
+  });
+
+  test("USAGE message advertises patients list", () => {
+    const result = (async () => run(["nope"]))();
+    return result.then((value) => {
+      expect(value.stderr).toBe("USAGE\n");
+      expect(value.stdout).toContain("clinicai patients list");
+    });
   });
 
 });

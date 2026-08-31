@@ -1,9 +1,12 @@
 import { chromium, type BrowserContext, type Page, type Request } from "playwright";
 import { CliError } from "./errors.js";
-import { parseAppointmentsEnvelope } from "./parser.js";
+import { parseAppointmentsEnvelope, parseFamilies, parseProfile } from "./parser.js";
 import type { CapturedRequest, RememberedIdentity, Session } from "./vault.js";
 
-export interface PortalTransport { listAppointments(session: Session): Promise<unknown>; }
+export interface PortalTransport {
+  listAppointments(session: Session): Promise<unknown>;
+  listPatients(session: Session, identity: RememberedIdentity): Promise<{ profile: unknown; families: unknown }>;
+}
 export type LoginCapture = { session: Session; rememberedIdentity: RememberedIdentity | null };
 export type FetchLike = (input: string, init: RequestInit) => Promise<Response>;
 
@@ -11,6 +14,8 @@ export const frontendOrigin = "https://citasenlinea.clinicainternacional.com.pe"
 export const backendOrigin = "https://prdexp.clinicainternacional.com.pe";
 export const loginPath = "/authentication/login/login-first-step";
 export const appointmentPath = "/v2/appointments/appointmentslist";
+export const profilePath = "/v1/patientdata/obtaindata";
+export const familiesPath = "/v1/patientdata/familylist";
 /** Exact accessible name of the visible official login control. */
 export const officialLoginButtonName = "Ingresar";
 const loginUrl = `${frontendOrigin}${loginPath}`;
@@ -74,6 +79,12 @@ export async function readRememberedIdentityFromSessionStorage(
 function validatedUrl(value: string): URL {
   const url = new URL(value);
   if (url.origin !== backendOrigin || url.pathname !== appointmentPath || url.search || url.hash) throw new CliError("PORTAL_CONTRACT_CHANGED");
+  return url;
+}
+
+function validatedBackendPath(value: string, expectedPath: string): URL {
+  const url = new URL(value);
+  if (url.origin !== backendOrigin || url.pathname !== expectedPath || url.search || url.hash) throw new CliError("PORTAL_CONTRACT_CHANGED");
   return url;
 }
 
@@ -241,9 +252,14 @@ function isExactSessionExpiredPayload(payload: unknown): boolean {
 /** Exact, minimal direct replay. It never invokes browser automation as a fallback. */
 export class DirectHttpTransport implements PortalTransport {
   constructor(private readonly request: FetchLike = fetch) {}
-  async listAppointments(session: Session): Promise<unknown> {
-    const url = validatedUrl(session.request.url);
-    const result = await this.request(url.toString(), { method: "GET", headers: session.request.headers });
+
+  /**
+   * Shared JSON request helper: parses, maps HTTP 401/403 and the exact
+   * HTTP-200 audited session-expired envelope to AUTH_REQUIRED uniformly
+   * across every operation, and rejects any other failure as PORTAL_REQUEST_FAILED.
+   */
+  private async jsonRequest(url: string, init: RequestInit): Promise<unknown> {
+    const result = await this.request(url, init);
     if (result.status === 401 || result.status === 403) throw new CliError("AUTH_REQUIRED");
     if (!result.ok) throw new CliError("PORTAL_REQUEST_FAILED");
     let payload: unknown;
@@ -253,12 +269,39 @@ export class DirectHttpTransport implements PortalTransport {
       throw new CliError("PORTAL_CONTRACT_CHANGED");
     }
     if (isExactSessionExpiredPayload(payload)) throw new CliError("AUTH_REQUIRED");
+    return payload;
+  }
+
+  async listAppointments(session: Session): Promise<unknown> {
+    const url = validatedUrl(session.request.url);
+    const payload = await this.jsonRequest(url.toString(), { method: "GET", headers: session.request.headers });
     try {
       parseAppointmentsEnvelope(payload);
     } catch {
       throw new CliError("PORTAL_CONTRACT_CHANGED");
     }
     return payload;
+  }
+
+  async listPatients(session: Session, identity: RememberedIdentity): Promise<{ profile: unknown; families: unknown }> {
+    const profileUrl = validatedBackendPath(`${backendOrigin}${profilePath}`, profilePath);
+    const profileHeaders = { ...session.request.headers, "content-type": "application/json" };
+    const profileBody = JSON.stringify({ documentNumber: identity.document, documentType: identity.documentType, idPatientHolder: false });
+    const profile = await this.jsonRequest(profileUrl.toString(), { method: "POST", headers: profileHeaders, body: profileBody });
+    try {
+      parseProfile(profile);
+    } catch {
+      throw new CliError("PORTAL_CONTRACT_CHANGED");
+    }
+    const familiesUrl = validatedBackendPath(`${backendOrigin}${familiesPath}`, familiesPath);
+    const familiesHeaders = { ...session.request.headers, "content-type": "application/json" };
+    const families = await this.jsonRequest(familiesUrl.toString(), { method: "GET", headers: familiesHeaders });
+    try {
+      parseFamilies(families);
+    } catch {
+      throw new CliError("PORTAL_CONTRACT_CHANGED");
+    }
+    return { profile, families };
   }
 }
 

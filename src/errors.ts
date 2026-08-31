@@ -1,6 +1,7 @@
 export type ErrorCode =
   | "AUTH_REQUIRED"
   | "AUTH_ARTIFACT_UNSUPPORTED"
+  | "IDENTITY_REQUIRED"
   | "KEYCHAIN_UNAVAILABLE"
   | "PORTAL_CONTRACT_CHANGED"
   | "LOGIN_NOT_COMPLETED"
@@ -10,10 +11,11 @@ export type ErrorCode =
 const messages: Record<ErrorCode, string> = {
   AUTH_REQUIRED: "Authentication required. Run clinicai auth login.",
   AUTH_ARTIFACT_UNSUPPORTED: "The portal session cannot be safely replayed. Run clinicai auth login.",
+  IDENTITY_REQUIRED: "A remembered document with type is required. Run clinicai auth login --remember-document.",
   KEYCHAIN_UNAVAILABLE: "macOS Keychain is unavailable; no authentication data was changed.",
   PORTAL_CONTRACT_CHANGED: "The portal response no longer matches the supported contract.",
   LOGIN_NOT_COMPLETED: "Login was not completed before a supported appointment request was observed.",
-  USAGE: "Usage: clinicai auth <login [--remember-document]|status|logout|forget-document> | clinicai appointments list",
+  USAGE: "Usage: clinicai auth <login [--remember-document]|status|logout|forget-document> | clinicai appointments list | clinicai patients list",
   PORTAL_REQUEST_FAILED: "The portal request could not be completed."
 };
 

@@ -44,7 +44,11 @@ export class MemoryVault implements SessionVault {
   private identity: RememberedIdentity | null = null;
   constructor(session: (Session & Partial<RememberedIdentity>) | null = null) {
     this.session = session ? { version: session.version, request: session.request } : null;
-    if (session?.document) this.identity = { document: session.document };
+    if (session?.document) {
+      const identity: RememberedIdentity = { document: session.document };
+      if (session.documentType) identity.documentType = session.documentType;
+      this.identity = identity;
+    }
   }
   async readSession() { return this.session; }
   async writeSession(session: Session) { this.session = session; }
