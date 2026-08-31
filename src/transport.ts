@@ -112,6 +112,39 @@ async function prefillDocument(page: Page, identity: RememberedIdentity | null):
   if (await input.count()) await input.fill(identity.document);
 }
 
+/**
+ * Installs a Playwright init script that, when the official login portal loads,
+ * pre-selects the remembered document type and prefills the document number by
+ * writing exactly three localStorage keys: rememberMeIsChecked=true,
+ * selectedDocumentTypeCode=<type>, and documentNumber=<document>. The portal
+ * reads these keys before rendering its document-type selector. No password key,
+ * no other storage reads or writes, and no process arguments are referenced.
+ *
+ * Only acts when the identity has a valid bounded documentType. Old identities
+ * without documentType keep the existing direct input fill. Setup failures from
+ * addInitScript are swallowed so observeLogin can continue with the direct
+ * input fill as a safe value check/fallback.
+ */
+export async function installRememberedLoginPrefill(page: Page, identity: RememberedIdentity | null): Promise<void> {
+  if (!identity) return;
+  const type = identity.documentType;
+  if (typeof type !== "string") return;
+  const trimmedType = type.trim();
+  if (!trimmedType || trimmedType.length > maxRememberedDocumentTypeLength) return;
+  try {
+    await page.addInitScript(
+      ({ document, documentType }: { document: string; documentType: string }) => {
+        localStorage.setItem("rememberMeIsChecked", "true");
+        localStorage.setItem("selectedDocumentTypeCode", documentType);
+        localStorage.setItem("documentNumber", document);
+      },
+      { document: identity.document, documentType: trimmedType },
+    );
+  } catch {
+    // Swallow setup failures so observeLogin can fall back to the direct input fill.
+  }
+}
+
 export async function captureDocumentOnOfficialLoginActivation(
   page: Page,
   rememberDocument: boolean,
@@ -311,6 +344,12 @@ export async function observeLogin(options: { rememberDocument: boolean; identit
   const context = await browser.newContext();
   const page = await context.newPage();
   try {
+    // Install the init script before navigation so the portal reads the remembered
+    // type and document from localStorage when it renders. addInitScript failures
+    // are swallowed inside installRememberedLoginPrefill; the post-goto direct
+    // input fill below acts as a safe value check/fallback so the user can still
+    // select the type manually.
+    await installRememberedLoginPrefill(page, options.identity);
     await page.goto(loginUrl, { waitUntil: "domcontentloaded" });
     await prefillDocument(page, options.identity);
     const submittedIdentity = await captureDocumentOnOfficialLoginActivation(page, options.rememberDocument);

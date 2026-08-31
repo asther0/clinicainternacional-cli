@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { run } from "../src/app.js";
 import { CliError } from "../src/errors.js";
 import { compareAppointments, parseAppointmentsEnvelope, parseFamilies, parsePatients, parseProfile } from "../src/parser.js";
-import { DirectHttpTransport, backendOrigin, appointmentPath, captureAfterAuthenticatedActivation, captureDocumentOnOfficialLoginActivation, captureReplayRequest, familiesPath, loginDocumentSelector, officialLoginButtonName, profilePath, readRememberedIdentityFromSessionStorage, rememberedIdentityFromAuthenticatedPair, rememberedIdentityFromSubmittedDocument, type LoginCapture, type PortalTransport } from "../src/transport.js";
+import { DirectHttpTransport, backendOrigin, appointmentPath, captureAfterAuthenticatedActivation, captureDocumentOnOfficialLoginActivation, captureReplayRequest, familiesPath, installRememberedLoginPrefill, loginDocumentSelector, officialLoginButtonName, profilePath, readRememberedIdentityFromSessionStorage, rememberedIdentityFromAuthenticatedPair, rememberedIdentityFromSubmittedDocument, type LoginCapture, type PortalTransport } from "../src/transport.js";
 import { MemoryVault, type RememberedIdentity, type Session, type SessionVault } from "../src/vault.js";
 
 const request = { url: `${backendOrigin}${appointmentPath}`, headers: { authorization: "Bearer redacted", channel: "web", idtransaction: "opaque", cookie: "sid=redacted" } };
@@ -867,4 +867,78 @@ describe("clinicai tracer contract", () => {
     });
   });
 
+});
+
+describe("installRememberedLoginPrefill", () => {
+  test("installs an init script that sets exactly three localStorage keys for typed identity", async () => {
+    const captures: Array<{ script: (...args: unknown[]) => unknown; arg: unknown }> = [];
+    const fakePage = {
+      addInitScript: async (script: (...args: unknown[]) => unknown, arg: unknown) => {
+        captures.push({ script, arg });
+      },
+    };
+    await installRememberedLoginPrefill(fakePage as never, { document: "12345678", documentType: "1" });
+    expect(captures).toHaveLength(1);
+    const { script, arg } = captures[0];
+    expect(arg).toEqual({ document: "12345678", documentType: "1" });
+    // Execute the captured script with a fake localStorage installed on globalThis.
+    const writes: Array<[string, string]> = [];
+    const reads: string[] = [];
+    const originalLocalStorage = Object.getOwnPropertyDescriptor(globalThis, "localStorage");
+    Object.defineProperty(globalThis, "localStorage", {
+      configurable: true,
+      value: {
+        setItem: (key: string, value: string) => { writes.push([key, value]); },
+        getItem: (key: string) => { reads.push(key); return null; },
+      },
+    });
+    try {
+      const fn = script as (arg: { document: string; documentType: string }) => void;
+      fn(arg as { document: string; documentType: string });
+      expect(writes).toEqual([
+        ["rememberMeIsChecked", "true"],
+        ["selectedDocumentTypeCode", "1"],
+        ["documentNumber", "12345678"],
+      ]);
+      expect(reads).toEqual([]);
+    } finally {
+      if (originalLocalStorage) Object.defineProperty(globalThis, "localStorage", originalLocalStorage);
+      else delete (globalThis as Record<string, unknown>).localStorage;
+    }
+  });
+
+  test("does not install init script for old identity without documentType", async () => {
+    let calls = 0;
+    const fakePage = {
+      addInitScript: async () => { calls += 1; throw new Error("should not call addInitScript"); },
+    };
+    await installRememberedLoginPrefill(fakePage as never, { document: "12345678" });
+    await installRememberedLoginPrefill(fakePage as never, null);
+    expect(calls).toBe(0);
+  });
+
+  test("does not install init script when documentType is invalid", async () => {
+    let calls = 0;
+    const fakePage = {
+      addInitScript: async () => { calls += 1; throw new Error("should not call addInitScript"); },
+    };
+    // Empty, whitespace-only, and over-long types must be rejected; the helper
+    // must never hand an unbounded type to the init script.
+    await installRememberedLoginPrefill(fakePage as never, { document: "12345678", documentType: "" });
+    await installRememberedLoginPrefill(fakePage as never, { document: "12345678", documentType: " " });
+    await installRememberedLoginPrefill(fakePage as never, { document: "12345678", documentType: "1".repeat(17) });
+    expect(calls).toBe(0);
+  });
+
+  test("continues without throwing when addInitScript setup fails", async () => {
+    const fakePage = {
+      addInitScript: async () => { throw new Error("setup failed"); },
+    };
+    // The helper must swallow addInitScript failures so observeLogin can fall
+    // back to the post-goto direct input fill; the user can still select the
+    // type manually.
+    await expect(
+      installRememberedLoginPrefill(fakePage as never, { document: "12345678", documentType: "1" }),
+    ).resolves.toBeUndefined();
+  });
 });
